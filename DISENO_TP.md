@@ -17,18 +17,20 @@ Modulation* (IEEE SPL, 2017). Ecuaciones 1, 2/3, 15 y 16.
 - **Un solo archivo**: `tp_final.ipynb`, formato de cuaderno (celdas markdown con el
   texto y celdas de código, `plt.show()` por bloque, sin `argparse` ni `main()`).
 - **Sin clases.** Las funciones se reservan para la lógica que se usa más de una vez o
-  que se lee mejor con nombre (`up_chirp`, `modular`, `demodular`, `correlacion_fft`,
-  `sincronizar`, `demodular_buffer`); las que se usan una sola vez van inline en su
-  sección. El archivo se lee de arriba hacia abajo, con variables sueltas por bloque,
-  y los bucles se permiten.
+  que se lee mejor con nombre (`up_chirp`, `modular`, `demodular`,
+  `construir_trama`, `correlacion_tiempo`, `correlacion_fft`, `detectar_tiempo`,
+  `detectar_frecuencia`, `fer_simulada`); las que se usan una sola vez van inline en
+  su sección. El archivo se lee de arriba hacia abajo, con variables sueltas por
+  bloque, y los bucles se permiten.
 - **Identificadores en español** y comentarios en español.
 - **Librerías**: `numpy` (importada como `np`), `matplotlib.pyplot` (importada como
   `plt`) y `adi` (pyadi-iio), que es el driver con el que se habla con el Pluto.
-  Las dos primeras son las del enunciado; `adi` entra en el bloque del SDR y en el
-  del PER, y el análisis de las Partes 1 y 3 no depende de ella.
-- **Alcance**: no se simulan canal AWGN/selectivo, curvas BER/PER ni Monte Carlo.
-  El ruido y el canal los aporta el enlace real entre placas. El PER no se simula:
-  se **mide** sobre el enlace real repitiendo la recepción (Parte 4).
+  Las dos primeras son las del enunciado; `adi` entra en la configuración del SDR y
+  en el FER con hardware, y el análisis del transmisor no depende de ella.
+- **Banda usable**: 900–920 MHz; la portadora se elige en 915 MHz.
+- **Alcance**: el FER del preámbulo se simula en Monte Carlo con canal FLAT y
+  selectivo en frecuencia, y además se **mide** sobre el enlace real repitiendo la
+  recepción (20 000 capturas).
 - El transmisor y el receptor comparten los parámetros del PHY de la sección 1.
 
 ### 0.1 Uso de numpy
@@ -42,15 +44,17 @@ por muestra. Estas son las familias de numpy que se usan, y por qué.
 | `np.asarray`, `np.zeros` | construir vectores y fijar el tipo | todo el archivo |
 | `np.complex128`, `np.int64` | señal en complejo; vector de TX en enteros de 16 bits | chirps, capturas, §2 |
 | `np.exp`, `np.pi` | exponenciales complejas de fase cuadrática | chirp (Eq. 3), portadora |
-| `np.fft.fft`, `.ifft`, `.fftshift` | correlación por FFT y espectro del dechirp | §4, §6, §8 |
-| `np.abs`, `np.real`, `np.imag` | módulo para métricas y figuras | §3, §4, §6, §8 |
-| `np.conj` | filtro adaptado: conjugado del chirp | dechirp (§4), correlación (§6) |
+| `np.fft.fft`, `.ifft` | correlación por FFT y espectro del dechirp | §2, §4, §5 |
+| `np.abs`, `np.real`, `np.imag` | módulo para métricas y figuras | §3, §4, §5 |
+| `np.conj` | filtro adaptado: conjugado del chirp | dechirp (§2), correlación (§4) |
 | `np.dot` | símbolo contra la base | §2, §4 |
-| `np.concatenate`, `np.tile` | armar la trama y extender el buffer circular | §5, §8 |
-| `np.argmax` | decidir el símbolo y ubicar el inicio | §4, §6 |
-| `np.sqrt`, `np.sum`, `np.linalg.norm` | normalizar amplitudes y medir la métrica | §1, §6 |
-| `np.mean` | potencia media del buffer simulado | §7 |
-| `np.random.default_rng` | semilla determinista para bits y ruido | §2, §7 |
+| `np.concatenate`, `np.tile` | armar la trama y el preámbulo | §2, §5 |
+| `np.roll` | desplazar la captura y los ecos del canal | §5 |
+| `np.cumsum` | energía acumulada para la métrica de detección | §4 |
+| `np.argmax` | decidir el símbolo y ubicar el inicio | §2, §4 |
+| `np.sqrt`, `np.sum`, `np.linalg.norm` | normalizar amplitudes y medir la métrica | §1, §4 |
+| `np.mean` | potencia media de la señal y del ruido | §1, §5 |
+| `np.random.default_rng` | semilla determinista para bits, ruido y desplazamientos | §2, §5 |
 
 ---
 
@@ -64,16 +68,19 @@ por muestra. Estas son las familias de numpy que se usan, y por qué.
 | `SamplingRate` (`Fs` en las ecuaciones) | 1 MSPS | tasa del SDR (una muestra por chip) |
 | `T = 1/B` | 1 µs | **derivado**: período de chip |
 | `Ts = M/B` | 256 µs | **derivado**: duración de un símbolo |
-| `fc` | 928 MHz | portadora (solo la usa el SDR) |
+| `fc` | 915 MHz | portadora dentro de la banda 900–920 MHz (solo la usa el SDR) |
 | `n_up` | 8 | up-chirps del preámbulo |
 | `n_down` | 2 | down-chirps completos |
 | `cuarto_down` | `True` | agregar el último 1/4 de down-chirp |
 | `n_simbolos` | 10 | símbolos del payload |
 | `tramas_en_buffer` | 2 | tramas que captura el receptor |
-| `n_paquetes_per` | 30000 | paquetes (tramas) evaluados para medir el PER |
+| `n_tramas_fer` | 30000 | tramas totales por curva de FER simulado |
+| `snr_fer_db` | −12..−1 | barrido de `Eb/N0` en pasos de 1 dB |
+| `n_tramas_enlace` | 20000 | capturas del FER con el SDR |
 
-Los últimos seis parámetros (`n_up`, `n_down`, `cuarto_down`, `n_simbolos`,
-`tramas_en_buffer`, `n_paquetes_per`) se escriben en minúsculas. Los físicos
+Los últimos parámetros (`n_up`, `n_down`, `cuarto_down`, `n_simbolos`,
+`tramas_en_buffer`, `n_tramas_fer`, `snr_fer_db`, `n_tramas_enlace`) se escriben en
+minúsculas. Los físicos
 (`SF`, `M`, `B`, `T`, `Ts`, `fc`) van en mayúsculas; la tasa del SDR es
 `SamplingRate`.
 
@@ -192,14 +199,15 @@ calculan con las fórmulas de la sección 1, no con estos números.
 
 ### 2.7 Gráficos del transmisor
 
-Dos figuras generadas dentro del `.ipynb`, sin guardar imágenes aparte:
+Cuatro figuras generadas dentro del `.ipynb`, sin guardar imágenes aparte, con las
+funciones `plotSignal` y `plotSpect` tomadas del HowTo:
 
-1. **Último símbolo del payload modulado**: parte real e imaginaria en el tiempo y
-   espectrograma. Se usa `simbolos_payload[-1]`, no un símbolo fijo, para que el
-   gráfico siga al bloque de bits.
-2. **Trama completa**: `Re{trama}` contra muestra, con líneas verticales en
-   `n_up·M` (fin de los up-chirps) y en `longitud_preambulo` (fin del preámbulo e
-   inicio del payload). Se acompaña con la vista por segmentos.
+1. **Señal del preámbulo**: `Re{}` e `Im{}` en el tiempo, en dos subplots
+   (`figsize=(20, 8)`).
+2. **PSD del preámbulo**: `plt.psd` con `NFFT=len(signal)` y `Fs=SamplingRate`
+   (`figsize=(15, 3)`).
+3. **Señal de la trama completa**: preámbulo + payload, con la misma `plotSignal`.
+4. **PSD de la trama completa**: la misma `plotSpect`.
 
 Todas las figuras usan `plt.show()` y no escriben archivos.
 
@@ -211,12 +219,11 @@ Todas las figuras usan `plt.show()` y no escriben archivos.
 cíclica, para que el receptor la capture en cualquier instante. Esta parte **no**
 captura ni decodifica: eso es la Parte 3.
 
-> Estado: implementado y revisado contra el HowTo; **no verificado con hardware**
-> (las placas no estuvieron accesibles).
+> Estado: implementado y verificado en loopback digital (captura de 10 368 muestras,
+> inicio 3612, métrica 1.0); falta la corrida final irradiando.
 >
-> **Orden implementado en el `.ipynb`**: transmisor (§1–§5) → SDR (§6) → receptor
-> (§7–§9) → PER (§10) → cierre (§11) → conclusiones (§12). La configuración del SDR
-> quedó antes del receptor y el cierre al final del archivo.
+> **Orden implementado en el `.ipynb`**: transmisor (celdas 1–13) → receptor
+> (14–16: señal, PSD y FER con el SDR) → cierre del enlace (17).
 
 ### 3.1 Conexión
 
@@ -232,16 +239,21 @@ captura ni decodifica: eso es la Parte 3.
 | Paso | Parámetro | Valor |
 |---|---|---|
 | 1 | `loopback` | `0` (deshabilitado) |
+| 1b | `ensm_mode` | `fdd` (full duplex; ver nota) |
 | 2 | `sample_rate` | `1e6` SPS |
 | 3 | `tx_rf_bandwidth` / `rx_rf_bandwidth` | `2e6` Hz |
 | 4 | `tx_hardwaregain_chan0` | `-60` dB (primer valor; el script usaba `-10`) |
 | 4 | `gain_control_mode_chan0` | `slow_attack` (AGC, sin ganancia manual) |
-| 5 | `tx_lo` / `rx_lo` | `928e6` Hz |
+| 5 | `tx_lo` / `rx_lo` | `915e6` Hz |
 | 6 | `tx_cyclic_buffer` | `True` (**antes** de transmitir) |
 | 6 | `rx_buffer_size` | `2 · longitud_trama = 10368` muestras |
 
 Notas de la tabla:
 
+- `ensm_mode = fdd` es obligatorio para recibir. Si otra sesión dejó el chip en
+  `alert`, el TX puede configurarse pero el RX no entrega muestras: `sdr.rx()`
+  termina en `Unable to dequeue block` (timeout 110) aunque el buffer se cree
+  bien. La configuración lo fuerza en cada corrida.
 - La recepción va con el AGC del Pluto (`slow_attack`): el código **no** fija
   ganancia manual. No es un olvido: en pyadi-iio el setter de
   `rx_hardwaregain_chan0` ignora el valor si el modo no es `manual`, así que
@@ -269,15 +281,15 @@ Notas de la tabla:
 3. Como el buffer es cíclico, esa única llamada deja la trama repitiéndose sin
    pausa: el Pluto la reinyecta sola, no hay que llamar a `tx()` en un bucle.
 4. **No cerrar acá**: el enlace queda abierto para que la Parte 3 capture y para que
-   la Parte 4 mida el PER con capturas repetidas. El cierre es obligatorio y va en un
-   bloque aparte, al final del archivo, después del receptor y del PER (sección 6).
+   el receptor mida el FER con capturas repetidas. El cierre es obligatorio y va en
+   un bloque aparte, al final del archivo, después del receptor (sección 7).
 
 ### 3.4 Requisito de hardware
 
-Las secciones del SDR, del receptor y del PER necesitan el Pluto y `pyadi-iio`, igual
+Las secciones del SDR y del FER con hardware necesitan el Pluto y `pyadi-iio`, igual
 que el HowTo: no hay `try/except` ni degradación automática. Si no está la placa, la
-ejecución se corta en la sección del SDR y no sigue hasta el receptor, el PER ni las
-conclusiones. La Parte 1 corre sin hardware.
+ejecución se corta en la sección del SDR y no sigue hasta el receptor ni el cierre.
+La Parte 1 corre sin hardware.
 
 ### 3.5 Contrato de salida y nivel de señal
 
@@ -310,7 +322,7 @@ Qué entra y qué sale de esta parte, y con qué criterio se ajusta la señal.
 
 **Frecuencia**
 
-- `tx_lo = rx_lo = 928 MHz`.
+- `tx_lo = rx_lo = 915 MHz` (banda usable 900–920 MHz).
 - TX y RX son la misma placa y comparten la referencia de reloj, así que no hay
   corrimiento de frecuencia entre ellos. El receptor no estima ni corrige CFO:
   sincroniza por correlación y demodula con dechirp + FFT.
@@ -326,7 +338,7 @@ Qué entra y qué sale de esta parte, y con qué criterio se ajusta la señal.
 3. El RX va con AGC (`slow_attack`), sin ganancia manual; `TxAtten` no se deja en
    0 dB salvo justificación medida.
 4. La conexión **no** se cierra al terminar esta parte: el objeto `sdr` queda vivo
-   para el receptor y el PER.
+   para el receptor y el FER con hardware.
 
 ### 3.7 Gráficos del SDR
 
@@ -337,43 +349,43 @@ recibida (ver 4.4).
 
 ## 4. Parte 3 — Receptor
 
-**Responsabilidad**: recuperar los `n_simbolos` símbolos del payload a partir de una
-captura del SDR que puede empezar en cualquier punto del buffer.
+**Responsabilidad**: a partir de una captura del SDR, detectar el preámbulo y medir
+cuántas tramas se detectan bien. La recuperación del payload ya quedó validada en el
+transmisor (§2.3, celda de demodulación ida y vuelta) y en el loopback digital.
 
-> Estado: implementado y verificado en simulación; **no verificado con hardware**.
+> Estado: detección implementada y verificada en simulación y en hardware (loopback
+> digital); el conteo de FER con el SDR queda para la corrida final.
 
 ### 4.1 Cadena
 
 ```
-buffer circular (2 tramas) → extensión circular
-→ detección en tiempo: correlación con el preámbulo (calculada por FFT) → inicio
-→ detección en frecuencia: dechirp + FFT sobre la ventana del payload → símbolo
-→ bits
+captura de 2 tramas → detección del preámbulo
+  en tiempo: correlación directa
+  en frecuencia: correlación por FFT
+→ inicio y métrica (0 a 1) → ¿métrica ≥ 0.5? → trama detectada o fallada
 ```
+
+La demodulación del payload desde el inicio detectado es la misma de §2.3
+(`dechirp + FFT`); el receptor del entregable la usa para validar la cadena, no para
+el conteo de FER.
 
 ### 4.2 Puntos críticos ya decididos
 
-- **Captura**: un `sdr.rx()` devuelve exactamente `rx_buffer_size` =
-  `tramas_en_buffer · longitud_trama` = 10368 muestras. Son dos repeticiones
-  consecutivas que arrancan en un instante cualquiera: pueden empezar en medio del
-  payload y pueden dar la vuelta por el borde del buffer. Como la ventana mide dos
-  tramas y la señal es periódica, al menos una copia completa cae dentro de la
-  captura, sin importar dónde arranque. Esa es toda la sincronización que da el
-  hardware. Se pueden pedir capturas seguidas sin reconfigurar: cada `rx()` entrega
-  una ventana nueva de la misma señal.
-- **Detección en tiempo (correlación)**: se correlaciona la captura con el
-  preámbulo completo y el inicio es el máximo. La correlación se calcula por FFT y
-  se normaliza para informar una `metrica` entre 0 y 1.
-- **Buffer circular**: se extiende la captura por ambos lados para que una trama que
-  da la vuelta aparezca contigua. Se lee siempre la copia central, la que cae dentro
-  del buffer, para que la ventana del payload entre completa.
-- **Detección en frecuencia (FFT)**: `Y = FFT(r · exp(-j2πk²/M))`; el índice del
-  pico es el símbolo. Se aplica sobre la ventana del payload ya sincronizada en
-  tiempo, con la misma FFT que usa la correlación.
+- **Captura**: un `sdr.rx()` devuelve `rx_buffer_size = tramas_en_buffer ·
+  longitud_trama = 10368` muestras, dos repeticiones consecutivas que arrancan en un
+  instante cualquiera. Como la señal es periódica, al menos una copia completa cae
+  dentro de la captura sin importar dónde arranque.
+- **Detección en tiempo**: `correlacion_tiempo` calcula `|correlate(captura, patrón)|`
+  en forma directa. Se usa en la demostración porque es la definición más legible.
+- **Detección en frecuencia**: `correlacion_fft` multiplica las FFT y vuelve al tiempo
+  con `ifft`; con `nfft` potencia de dos y `mode="valid"`. Es la que corre en el
+  receptor porque es más rápida y escala a lotes 2D.
+- **Métrica**: `pico / (||patrón|| · sqrt(energía de la ventana))`, entre 0 y 1. En el
+  receptor real no se conoce la posición verdadera, así que la decisión es
+  `métrica ≥ 0.5`; en la simulación se compara contra la posición real, que es más
+  estricto porque una falsa alarma también cuenta como falla.
 - **Sin CFO**: TX y RX comparten oscilador, así que no hay corrimiento de frecuencia
-  que deforme la correlación. Se decidió no implementar estimación ni corrección de
-  CFO porque no forma parte del alcance de la materia y no hace falta para este
-  montaje.
+  que deforme la correlación. No se implementa estimación ni corrección de CFO.
 
 ### 4.3 Criterios de aceptación
 
@@ -381,161 +393,159 @@ buffer circular (2 tramas) → extensión circular
    el código lo advierte.
 2. Loopback digital (`loopback = 1`) recupera exactamente los `n_simbolos` símbolos
    del payload: valida TX, RX y la demodulación sin irradiar.
-3. La captura no está recortada: sin mesetas planas en los picos de `Re{captura}` ni
-   `Im{captura}`.
-4. Se puede repetir `sdr.rx()` sin reconfigurar y las dos capturas decodifican el
-   mismo payload: prueba de que el TX sigue ciclando y el enlace quedó vivo.
-5. La trama puede cruzar cualquiera de los dos bordes del buffer y el inicio
-   detectado se informa módulo la longitud del buffer.
-6. Con offset y ruido hasta `SNR = 0 dB` los `n_simbolos` símbolos coinciden con los
-   transmitidos; con `SNR = 0 dB` la métrica del pico no baja de 0.8.
-
-> Los criterios 5 y 6 salían de pruebas sintéticas que ya se retiraron del
-> entregable. La verificación real es con las placas y con el buffer capturado.
+3. En la demostración con la trama desplazada y ruido, los dos métodos informan el
+   mismo inicio y una métrica alta.
+4. Se puede repetir `sdr.rx()` sin reconfigurar y las capturas siguen decodificando el
+   mismo payload.
+5. El conteo de FER corre sobre 20 000 capturas sin reconfigurar el enlace.
 
 ### 4.4 Gráficos del receptor
 
-Un solo gráfico, de la **señal recibida** (antes figuraba en la parte del SDR):
+- **Señal recibida**: `Re{captura}` e `Im{captura}` en el tiempo.
+- **PSD de la señal recibida**: `plt.psd` con `NFFT` y `Fs` del HowTo.
 
-- Arriba: `Re{captura}` e `Im{captura}` en el tiempo, las dos tramas completas.
-- Abajo: `|captura|`, la envolvente. El rizado sobre la envolvente es el ruido del
-  canal y el desvanecimiento del enlace; con el TX ciclando sin pausa no hay huecos
-  de silencio, así que la diferencia con el ruido se ve como rizado, no como tramos
-  vacíos.
-- No se grafica la señal transmitida: la trama ya se muestra en la Parte 1 (§2.7) y
-  acá lo que interesa es qué llegó.
+No se grafica la señal transmitida: la trama ya se muestra en el transmisor y acá lo
+que interesa es qué llegó.
 
 ---
 
-## 5. Parte 4 — PER (Packet Error Rate)
+## 5. FER en simulación
 
-**Responsabilidad**: medir cuántas de las tramas recibidas se decodifican mal,
-repitiendo la recepción de la **misma** señal muchas veces. La señal transmitida es
-periódica y siempre la misma trama, así que cada captura es una observación nueva del
-mismo paquete y el receptor conoce de antemano los símbolos esperados.
+**Responsabilidad**: medir la fracción de preámbulos que el detector no encuentra, en
+dos canales simulados, barriendo la SNR.
 
-> Estado: **implementado y verificado en simulación** con un SDR simulado; falta la
-> corrida con hardware. No se puede validar el tiempo real de 30 000 capturas sin la
-> placa.
+> Estado: **implementado y verificado en simulación**; la celda tarda ≈77 s.
 
-### 5.1 Idea
+### 5.1 Criterio de error
 
-Como el TX cicla la misma trama, recepciones sucesivas entregan tramas idénticas en
-el aire. Comparando lo decodificado contra lo transmitido se cuenta, sobre `N`
-paquetes, cuántos salieron con error. Eso da una estimación empírica del PER del
-enlace real, sin simulaciones de Monte Carlo.
+- Se genera un preámbulo y se lo rota circularmente una cantidad aleatoria de muestras
+  (modela una captura que arranca en cualquier punto de la trama periódica).
+- Se pasa por el canal y se suma ruido.
+- Se detecta con `detectar_frecuencia` en modo circular y se compara el inicio
+  detectado con el desplazamiento real: si coincide, la trama se detectó; cualquier
+  otro pico (incluida una falsa alarma) cuenta como falla.
+- `FER = falladas / simuladas`. El payload no participa.
 
-### 5.2 Procedimiento
+### 5.2 Canales
 
-1. Fijar `n_paquetes_per` (parámetro editable de la tabla 1): **30000 paquetes**.
-2. Repetir la recepción hasta juntar `n_paquetes_per` paquetes: `captura = sdr.rx()`
-   y decodificar con la Parte 3 (extensión circular → sincronización →
-   demodulación). Cada captura aporta **un** paquete: la copia central que decodifica
-   `demodular_buffer`.
-3. Comparar los `n_simbolos` decodificados contra los símbolos transmitidos
-   (`simbolos_payload`), que se conocen porque el receptor es del mismo TP.
-4. Contar un paquete como erróneo si **al menos un** símbolo no coincide. El conteo
-   de símbolos erróneos se informa como métrica complementaria, pero el PER que se
-   informa es por paquete.
-5. Acumular los contadores entre capturas y entre corridas de la celda:
-   `paquetes_recibidos += 1` y `paquetes_erroneos += 1` si hubo error. Al volver a
-   correr la celda se completan solo los paquetes que faltan hasta `n_paquetes_per`,
-   así que una corrida cortada se puede retomar.
-6. Informar `PER = paquetes_erroneos / paquetes_recibidos` junto con los dos
-   contadores. Sin `N` grande el PER no es confiable: mostrarlo siempre con su `N`.
+| Canal | Modelo |
+|---|---|
+| FLAT | Solo AWGN: `r = s + n`, sin multitrayecto |
+| Selectivo en frecuencia | FIR de 3 ecos: retardos 0, 20 y 50 muestras; amplitudes 1, 0.9 y 0.7 con fases 0, 2.1 y 5.3 rad, normalizado a energía unitaria |
 
-### 5.3 Cantidad de paquetes y tiempo
+El retardo máximo (50 µs) da una coherencia de banda del orden de 20 kHz, muy menor
+que `B = 1 MHz`: el canal cambia dentro de la banda de la señal.
 
-- `n_paquetes_per = 30000` es el objetivo: con esa `N`, un solo error da un PER de
-  `3.3e-5`, y si no hay ninguno el intervalo superior (regla de tres) es `1e-4`. Es
-  el orden de magnitud que hace medible un PER bajo.
-- Cada paquete dura `longitud_trama / SamplingRate` = 5.184 ms, así que 30 000
-  paquetes son ≈ 155 s de señal en el aire.
-- Cada `sdr.rx()` trae `tramas_en_buffer = 2` copias, pero la implementación evalúa
-  **una sola** (la copia central) para que las observaciones no estén correlacionadas:
-  hacen falta 30 000 capturas. Cada captura ocupa 10.368 ms de buffer, así que el
-  piso de tiempo es ≈ 311 s más el procesamiento por captura (unos 5 minutos de
-  señal); conviene medirlo antes de fijar la corrida final.
-- La segunda copia de cada captura queda sin usar. Aprovecharla reduciría las
-  capturas a la mitad, pero las dos copias están separadas por 5 ms y no son
-  observaciones independientes; se prefiere el conteo limpio.
+### 5.3 Barrido y figura
 
-### 5.4 Decisiones tomadas
+- `SNR = Eb/N0` de −12 a −1 dB en pasos de 1 dB. Con `SNR_por_muestra` en ese rango el
+  FER sería 0 en todos los puntos; la relación usada es
+  `SNR_por_muestra = Eb/N0 − 10·log10(M/SF)`, con un offset de 15.05 dB para
+  `M = 256`, `SF = 8`.
+- `n_tramas_fer = 30000` tramas **en total por curva** (2500 por punto), con semilla
+  fija por punto.
+- Detección por correlación **circular** por FFT: es la más rápida y es coherente con
+  un TX que repite la trama sin pausa. Un detector lineal sobre una ventana corta
+  subestimaría el FER porque tendría muchas menos posiciones donde producir falsas
+  alarmas.
+- Gráfico semilogarítmico con las dos curvas; un FER de 0 se dibuja en `1/(2·N)`.
+- Resultado medido: FLAT baja de 0.83 a 0.02; el selectivo baja de 0.97 a 0.39 y queda
+  siempre por encima. La celda completa tarda ≈77 s.
 
-- **Acumular entre corridas**: sí. Permite cortar y retomar sin reconfigurar y con el
-  enlace caliente; el reinicio es explícito (tres asignaciones a cero comentadas al
-  principio de la celda). Si cambia `TxAtten` o la distancia, hay que reiniciar para
-  no mezclar condiciones.
-- **Una copia por captura**: se evalúa solo la copia central, aunque el buffer traiga
-  dos. Preferible a contar copias correlacionadas entre sí.
-- **Criterio de error**: por símbolo (el paquete es erróneo si algún símbolo falla),
-  con el conteo de símbolos erróneos como métrica extra.
+### 5.4 Criterios de aceptación
 
-### 5.5 Criterios de aceptación
-
-1. La celda de PER no reconfigura el SDR: usa el `sdr` que dejó abierto la Parte 2.
-2. Cada captura se decodifica con la misma cadena de la Parte 3, sin duplicar lógica.
-3. `PER = paquetes_erroneos / paquetes_recibidos`, informado junto con `N`.
-4. En loopback digital (`loopback = 1`) el PER da 0 sobre los 30 000 paquetes: sirve
-   de control de la cadena completa.
-5. Los contadores se pueden reiniciar sin cerrar el enlace.
-
-### 5.6 Gráfico del PER
-
-Implementado: `PER` acumulado contra paquetes recibidos, con un punto cada 10 % del
-objetivo. Complementa el `print` con `N`, paquetes erróneos, símbolos erróneos y
-`PER` final.
+1. Ambas curvas bajan al crecer `Eb/N0`.
+2. La curva selectiva queda por encima de la FLAT en todo el barrido.
+3. El resultado es reproducible con las semillas fijas.
+4. La sección corre sin hardware: no toca el SDR.
 
 ---
 
-## 6. Cierre del enlace (obligatorio, al final del archivo)
+## 6. FER con el SDR
+
+**Responsabilidad**: medir empíricamente cuántas capturas reales se detectan bien.
+Como el TX cicla la misma trama, cada `sdr.rx()` es una observación nueva del mismo
+paquete.
+
+### 6.1 Procedimiento
+
+1. `n_tramas_enlace = 20000` capturas.
+2. En cada una: `captura = sdr.rx()` y `detectar_frecuencia(captura)`.
+3. Se cuenta como detectada si `métrica ≥ 0.5`; si no, fallada. No se usa la posición
+   verdadera porque en el enlace real no se conoce.
+4. Se informa el avance cada 2000 capturas y al final `FER = falladas / 20000`, junto
+   con los dos contadores. Sin gráfico.
+
+### 6.2 Tiempo
+
+- Cada captura de 10 368 muestras tarda ≈60 ms (≈50 ms son overhead del backend de
+  red, no de la señal); la detección agrega pocos ms.
+- 20 000 capturas ≈ 20 minutos. La celda lo advierte antes de arrancar.
+
+### 6.3 Criterios de aceptación
+
+1. La celda no reconfigura el SDR: usa el `sdr` que dejó abierto la configuración.
+2. Usa la misma `detectar_frecuencia` de §4, sin duplicar lógica.
+3. Informa `FER` junto con `N` y los contadores.
+4. En loopback digital el FER da 0: sirve de control de la cadena completa.
+
+---
+
+## 7. Cierre del enlace (obligatorio, al final del archivo)
 
 El cierre no es opcional: si no se ejecuta, el Pluto queda conectado y emitiendo.
-Va en un bloque aparte **al final del archivo**, después del receptor y del PER,
-porque el archivo se ejecuta por bloques y mientras el enlace esté abierto se puede
-volver a capturar para confirmar la recepción y sumar paquetes al PER.
+Va en un bloque aparte **al final del archivo**, después del receptor, porque el
+archivo se ejecuta por bloques y mientras el enlace esté abierto se puede volver a
+capturar.
 
 - Orden del cierre, idéntico al HowTo: `tx_destroy_buffer()`,
   `tx_hardwaregain_chan0 = -89`, `tx_lo = 2400 MHz`, `rx_lo = 950 MHz`,
   `tx(np.zeros(2048))`. Sin guardas: si el enlace está abierto, el cierre corre.
 - Motivo: el Pluto no tiene `tx_off`; para callarlo hay que bajarle la potencia y
-  sacarlo de la banda. Dejarlo emitiendo en 928 MHz al terminar la práctica molesta
+  sacarlo de la banda. Dejarlo emitiendo en 915 MHz al terminar la práctica molesta
   a los demás grupos.
 - Si se vuelve a correr la parte del SDR después del cierre, se crea un objeto nuevo
   y el enlace queda abierto otra vez.
 - Criterio: el bloque corre sin excepciones y deja el TX atenuado (`-89 dB`) y en
-  2400 MHz. Si se ejecuta dos veces, la segunda informa que no hay enlace abierto.
+  2400 MHz.
 
 ---
 
-## 7. Plan de progreso
+## 8. Estructura del entregable
 
-| Parte | Diseño | Implementación | Verificación |
-|---|---|---|---|
-| 1. Transmisor | Cerrado | En `tp_final.ipynb` §1–§5 | Simulación: OK |
-| 2. SDR (config + emisión) | Cerrado | En `tp_final.ipynb` §6 | **Pendiente: hardware** |
-| 3. Receptor | Cerrado (borrador) | En `tp_final.ipynb` §7–§9 | Simulación: OK |
-| 4. PER | Cerrado | En `tp_final.ipynb` §10 | Simulación: OK; **hardware pendiente** |
-| 5. Cierre | Cerrado | En `tp_final.ipynb` §11 | **Pendiente: hardware** |
+El notebook tiene una celda por subpunto, en este orden:
+
+| Celda | Bloque | Contenido |
+|---|---|---|
+| 1 | Transmisor | Parámetros del PHY y del preámbulo |
+| 2 | Transmisor | De bits a símbolo |
+| 3 | Transmisor | Modulación de símbolo (`up_chirp`, `down_chirp`, `modular`, `preambulo`) |
+| 4 | Transmisor | Gráfico de la señal del preámbulo (`plotSignal`) |
+| 5 | Transmisor | PSD del preámbulo (`plotSpect`) |
+| 6 | Transmisor | Gráfico de la trama completa |
+| 7 | Transmisor | PSD de la trama completa |
+| 8 | Transmisor | Demodulación (ida y vuelta) |
+| 9 | Transmisor | Armado de la trama (`construir_trama`) |
+| 10 | Transmisor | Detección en tiempo y en frecuencia + demostración |
+| 11 | Transmisor | FER vs SNR (FLAT y selectivo) |
+| 12 | Transmisor | Configuración del SDR |
+| 13 | Transmisor | Envío de la señal al SDR |
+| 14 | Receptor | Gráfico de la señal recibida |
+| 15 | Receptor | PSD de la señal recibida |
+| 16 | Receptor | FER con 20 000 tramas |
+| 17 | Cierre | Cierre del enlace |
 
 **Deuda pendiente del entregable**:
 
-- [x] Parámetros del PHY y dependencia de `SF` (configuración en minúsculas).
-- [x] Transmisor: bits aleatorios deterministas, modulación y trama.
-- [x] Gráficos del transmisor: último símbolo del payload y trama completa.
-- [x] Receptor: sincronización por correlación, demodulación y buffer de 2 tramas.
+- [x] Parámetros del PHY y dependencia de `SF`.
+- [x] Transmisor: bits aleatorios deterministas, modulación, trama y demodulación.
+- [x] Gráficos del transmisor: preámbulo, trama completa y sus PSD.
+- [x] Detección en tiempo (correlación directa) y en frecuencia (FFT), por separado.
+- [x] FER en simulación (FLAT y selectivo), SNR −12..−1, 30 000 tramas por curva.
 - [x] SDR: configuración del HowTo, IP del grupo y RX de 2 tramas.
+- [x] Receptor: gráficos de señal y PSD, FER con 20 000 tramas.
 - [x] Cierre obligatorio en bloque aparte, al final del archivo.
-- [x] Ganancia de RX moderada (30 dB) y documentada como nunca-máximo.
-- [x] **Reordenar el `.ipynb`**: SDR antes del receptor; cierre al final, después del
-  PER.
-- [x] **Implementar la Parte 4 (PER)**: recepción repetida de la misma señal,
-  comparación contra los símbolos transmitidos y contadores acumulados para 30 000
-  paquetes.
-- [ ] Reemplazar los 18 `def` por código lineal (restricción del entregable).
-- [x] Sacar las pruebas sintéticas de la sección 7 (cadena completa con offset y
-  ruido). La sección 9 se conserva porque modela el buffer de recepción de dos
-  tramas.
-- [ ] Verificar la cadena completa con las placas del laboratorio.
+- [ ] Reemplazar los `def` por código lineal (restricción del entregable).
+- [ ] Correr el FER con el SDR en el laboratorio (≈20 min).
 - [ ] Ajustar `TxAtten` en la medición real (el RX va con AGC).
-- [ ] Medir el tiempo real de 30 000 capturas para el PER con el enlace abierto.
+
