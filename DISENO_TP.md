@@ -74,13 +74,14 @@ por muestra. Estas son las familias de numpy que se usan, y por qué.
 | `cuarto_down` | `True` | agregar el último 1/4 de down-chirp |
 | `n_simbolos` | 10 | símbolos del payload |
 | `tramas_en_buffer` | 2 | tramas que captura el receptor |
-| `n_tramas_fer` | 30000 | tramas totales por curva de FER simulado |
+| `NFLAT` | 50000 | tramas por punto del canal FLAT |
+| `NSELECTIVE` | 50000 | tramas por punto del canal selectivo |
 | `snr_fer_db` | −12..−1 | barrido de `Eb/N0` en pasos de 1 dB |
 | `n_tramas_enlace` | 20000 | capturas del FER con el SDR |
 
 Los últimos parámetros (`n_up`, `n_down`, `cuarto_down`, `n_simbolos`,
-`tramas_en_buffer`, `n_tramas_fer`, `snr_fer_db`, `n_tramas_enlace`) se escriben en
-minúsculas. Los físicos
+`tramas_en_buffer`, `snr_fer_db`, `n_tramas_enlace`) se escriben en minúsculas;
+`NFLAT` y `NSELECTIVE` quedan en mayúsculas para distinguirlos. Los físicos
 (`SF`, `M`, `B`, `T`, `Ts`, `fc`) van en mayúsculas; la tasa del SDR es
 `SamplingRate`.
 
@@ -411,30 +412,53 @@ que interesa es qué llegó.
 
 ## 5. FER en simulación
 
-**Responsabilidad**: medir la fracción de preámbulos que el detector no encuentra, en
-dos canales simulados, barriendo la SNR.
+**Responsabilidad**: medir la fracción de tramas cuyo preámbulo el detector no
+encuentra, en dos canales simulados, barriendo la SNR.
 
-> Estado: **implementado y verificado en simulación**; la celda tarda ≈77 s.
+> Estado: **implementado**; la corrida de 50 000 tramas por punto tarda ≈55 min con `lote=50`.
 
 ### 5.1 Criterio de error
 
-- Se genera un preámbulo y se lo rota circularmente una cantidad aleatoria de muestras
-  (modela una captura que arranca en cualquier punto de la trama periódica).
-- Se pasa por el canal y se suma ruido.
-- Se detecta con `detectar_frecuencia` en modo circular y se compara el inicio
-  detectado con el desplazamiento real: si coincide, la trama se detectó; cualquier
-  otro pico (incluida una falsa alarma) cuenta como falla.
-- `FER = falladas / simuladas`. El payload no participa.
+- Se genera la **trama completa** (preámbulo + payload) y se la rota circularmente una
+  cantidad aleatoria de muestras (modela una captura que arranca en cualquier punto de
+  la trama periódica).
+- Se pasa por el canal **por convolución** con la respuesta al impulso, frame por
+  frame, y se suma ruido gaussiano complejo.
+- Se detecta con `detectar_frecuencia` en modo circular, usando **solo el preámbulo**
+  como patrón, y se compara el inicio detectado con el desplazamiento real: si
+  coincide, la trama se considera correcta; cualquier otro pico (incluida una falsa
+  alarma) cuenta como falla.
+- `FER = falladas / simuladas`. El payload está presente en la captura, pero no se
+  demodula: el criterio es únicamente la detección del preámbulo. **A confirmar
+  mañana** si el payload debe evaluarse de otra forma.
+- **Acumulación y checkpoint**: el FER se acumula por bloques de 500 tramas. Después
+  de cada bloque se guarda `fer_checkpoint.npz` con `fallas` y `hechas`; si el proceso
+  se corta, se retoma desde el último bloque. El archivo incluye una versión y se
+  reinicia solo si cambia el canal, el ruido o la captura.
+- **Tramas fijas**: `NFLAT = 50 000` y `NSELECTIVE = 50 000` tramas por punto. No hay
+  criterio adaptativo: se recorren los 12 valores de SNR con la misma cantidad de
+  tramas. La resolución del FER es `1/50 000`.
+- **Lote**: `lote_fer = 50` procesa 50 tramas por FFT. La memoria sigue siendo chica
+  (~2 MB por captura) y el tiempo total es ≈55 min; el lote no cambia el estimador,
+  solo la memoria y la velocidad.
+- **Alcance de la detección**: el patrón de correlación es **solo el preámbulo**
+  (2624 muestras). En el receptor real la búsqueda recorre **toda la captura** de dos
+  tramas (10 368 muestras), incluido el payload; en la simulación del FER la captura
+  es una trama completa (5184 muestras) rotada circularmente, así que la búsqueda
+  recorre toda la trama pero el patrón sigue siendo el preámbulo.
 
 ### 5.2 Canales
 
 | Canal | Modelo |
 |---|---|
 | FLAT | Solo AWGN: `r = s + n`, sin multitrayecto |
-| Selectivo en frecuencia | FIR de 3 ecos: retardos 0, 20 y 50 muestras; amplitudes 1, 0.9 y 0.7 con fases 0, 2.1 y 5.3 rad, normalizado a energía unitaria |
+| Selectivo en frecuencia | `h(nT) = √0.8·δ(nT) + √0.2·δ(nT − T)`, dos taps separados 1 muestra, aplicado por convolución frame por frame. Las raíces dan energía unitaria (`0.8 + 0.2 = 1`) |
 
-El retardo máximo (50 µs) da una coherencia de banda del orden de 20 kHz, muy menor
-que `B = 1 MHz`: el canal cambia dentro de la banda de la señal.
+El eco llega una muestra (1 µs) después del camino directo. La coherencia de banda
+es del orden de `1/T = 1 MHz`, comparable a `B`. El paper escribe `0.8` y `0.2` y
+llama al canal "unit energy"; en el TP se usan `√0.8` y `√0.2` para que la energía
+sea exactamente 1, como en `Untitled3.ipynb`. El ruido es gaussiano complejo de media
+cero con `Pz = (1/M)/SNR` y `σ = √(Pz/2)` por parte real/imaginaria (ecuación (10)).
 
 ### 5.3 Barrido y figura
 
@@ -442,22 +466,27 @@ que `B = 1 MHz`: el canal cambia dentro de la banda de la señal.
   FER sería 0 en todos los puntos; la relación usada es
   `SNR_por_muestra = Eb/N0 − 10·log10(M/SF)`, con un offset de 15.05 dB para
   `M = 256`, `SF = 8`.
-- `n_tramas_fer = 30000` tramas **en total por curva** (2500 por punto), con semilla
-  fija por punto.
+- `NFLAT = NSELECTIVE = 50 000` tramas fijas por punto. `lote_fer = 50` y checkpoint
+  cada 500 tramas. La corrida completa son 12 × 50 000 × 2 = 1 200 000 tramas.
 - Detección por correlación **circular** por FFT: es la más rápida y es coherente con
   un TX que repite la trama sin pausa. Un detector lineal sobre una ventana corta
   subestimaría el FER porque tendría muchas menos posiciones donde producir falsas
   alarmas.
-- Gráfico semilogarítmico con las dos curvas; un FER de 0 se dibuja en `1/(2·N)`.
-- Resultado medido: FLAT baja de 0.83 a 0.02; el selectivo baja de 0.97 a 0.39 y queda
-  siempre por encima. La celda completa tarda ≈77 s.
+- Gráfico semilogarítmico con las dos curvas y un tick por cada SNR, de −12 a −1; un
+  FER de 0 se dibuja en `1/(2·NFLAT)`.
+- Resultado: la corrida de 50 000 tramas por punto se ejecuta al correr la celda y
+  llena la tabla y el gráfico. Con `lote=50` tarda ≈55 min. Una prueba rápida con 200
+  tramas por punto mostró el selectivo por encima del FLAT, como se espera; la corrida
+  final de 50k da la curva suave.
 
 ### 5.4 Criterios de aceptación
 
 1. Ambas curvas bajan al crecer `Eb/N0`.
-2. La curva selectiva queda por encima de la FLAT en todo el barrido.
+2. La curva selectiva queda por encima de la FLAT, como en el canal selectivo del
+   paper.
 3. El resultado es reproducible con las semillas fijas.
 4. La sección corre sin hardware: no toca el SDR.
+5. El checkpoint permite retomar sin repetir los puntos ya completados.
 
 ---
 
@@ -541,7 +570,7 @@ El notebook tiene una celda por subpunto, en este orden:
 - [x] Transmisor: bits aleatorios deterministas, modulación, trama y demodulación.
 - [x] Gráficos del transmisor: preámbulo, trama completa y sus PSD.
 - [x] Detección en tiempo (correlación directa) y en frecuencia (FFT), por separado.
-- [x] FER en simulación (FLAT y selectivo), SNR −12..−1, 30 000 tramas por curva.
+- [x] FER en simulación (FLAT y selectivo), SNR −12..−1, 50 000 tramas fijas por punto con checkpoint.
 - [x] SDR: configuración del HowTo, IP del grupo y RX de 2 tramas.
 - [x] Receptor: gráficos de señal y PSD, FER con 20 000 tramas.
 - [x] Cierre obligatorio en bloque aparte, al final del archivo.
